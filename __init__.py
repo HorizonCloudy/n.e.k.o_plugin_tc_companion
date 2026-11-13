@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import socket
 import time
 from pathlib import Path
 from typing import Annotated
@@ -107,13 +106,15 @@ class TcCompanionPlugin(NekoPluginBase):
             "manual_available": bool(game and tc.manual_dir(game).exists()),
             "allow_write": bool(cfg.get("allow_write", True)),
             "install_bridge": bool(cfg.get("install_bridge", False)),
+            "bridge_port": cfg.get("bridge_port", tc.BRIDGE_PORT_DEFAULT),
+            "bridge_token_set": bool(str(cfg.get("bridge_token", "") or "").strip()),
             "verify_game": str(cfg.get("verify_game", "auto")),
             "verify": tc.verify_enabled(cfg, game),
             "install": self._install_result,
         }
         if out["game_running"]:
             try:
-                out["bridge"] = await asyncio.to_thread(self._bridge, {"cmd": "status"}, 1.5)
+                out["bridge"] = await asyncio.to_thread(self._bridge, {"cmd": "status"}, 1.5, cfg)
             except SdkError as exc:
                 out["bridge_error"] = str(exc)
         return out
@@ -241,29 +242,30 @@ class TcCompanionPlugin(NekoPluginBase):
             }
         raise SdkError(f"未知 action：{action}")
 
-    def _bridge(self, payload: dict, timeout: float = 8.0) -> dict:
+    def _bridge(self, payload: dict, timeout: float = 8.0, cfg: dict | None = None) -> dict:
+        cfg = cfg if isinstance(cfg, dict) else {}
+        port = tc.BRIDGE_PORT_DEFAULT
         try:
-            with socket.create_connection(("127.0.0.1", 47654), timeout=timeout) as sock:
-                sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-                data = b""
-                while not data.endswith(b"\n"):
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    data += chunk
+            port = tc.bridge_port(cfg)
+            return tc.bridge_request(
+                payload,
+                port=port,
+                timeout=timeout,
+                max_bytes=tc.bridge_max_bytes(cfg),
+                token=str(cfg.get("bridge_token", "") or ""),
+            )
+        except tc.BridgeError as exc:
+            raise SdkError(str(exc)) from exc
         except OSError as exc:
-            raise SdkError(f"控制桥未运行（127.0.0.1:47654）：{exc}")
-        try:
-            return json.loads(data.decode("utf-8", "replace"))
-        except json.JSONDecodeError as exc:
-            raise SdkError(f"控制桥返回了非 JSON：{data[:200]!r}") from exc
+            raise SdkError(f"控制桥未运行（127.0.0.1:{port}）：{exc}") from exc
 
     async def _bridge_op(self, action: str = "status", **extra) -> dict:
         action = (action or "status").strip().lower()
         allowed = {"status", "ping", "run", "stop", "reset", "undo", "redo", "save", "place", "components"}
         if action not in allowed:
             raise SdkError(f"未知 action：{action}")
-        if action in {"place", "undo", "redo", "save", "reset"} and not bool((await self._cfg()).get("allow_write", True)):
+        cfg = await self._cfg()
+        if action in {"place", "undo", "redo", "save", "reset"} and not bool(cfg.get("allow_write", True)):
             raise SdkError("配置里 allow_write=false，已拒绝通过控制桥改动游戏")
         circuit = None
         if action == "save":
@@ -271,7 +273,7 @@ class TcCompanionPlugin(NekoPluginBase):
             if tc.verify_enabled(cfg, game):
                 circuit = self._schematic(user, settings) / "circuit.data"
                 before = circuit.stat().st_mtime if circuit.exists() else 0.0
-        reply = await asyncio.to_thread(self._bridge, {"cmd": action, **extra})
+        reply = await asyncio.to_thread(self._bridge, {"cmd": action, **extra}, 8.0, cfg)
         if circuit is not None:
             # 回读：circuit.data 的 mtime 变了才算真的存了盘；存档名按 levels.txt 推断
             deadline = time.monotonic() + 3.0
@@ -296,7 +298,7 @@ class TcCompanionPlugin(NekoPluginBase):
         if action == "context":
             info = tc.level_info(game, level) if game else {}
             try:
-                bridge = await asyncio.to_thread(self._bridge, {"cmd": "status"}, 1.5)
+                bridge = await asyncio.to_thread(self._bridge, {"cmd": "status"}, 1.5, cfg)
             except SdkError:
                 bridge = None
             files = {}
@@ -340,7 +342,7 @@ class TcCompanionPlugin(NekoPluginBase):
             if not tc.is_game_running():
                 raise SdkError("游戏没在运行：请自己打开游戏并进入该关卡后再 verify（插件不会替你启动游戏）")
             before = tc.level_progress(tc.read_levels(user), level)
-            run = await asyncio.to_thread(self._bridge, {"cmd": "run", "cycles": int(cycles)})
+            run = await asyncio.to_thread(self._bridge, {"cmd": "run", "cycles": int(cycles)}, 8.0, cfg)
             if run.get("ok") is False:
                 raise SdkError(f"控制桥 run 失败：{run.get('error')}")
             after, deadline = before, time.monotonic() + min(max(float(wait_seconds), 1.0), 25.0)
@@ -433,7 +435,7 @@ class TcCompanionPlugin(NekoPluginBase):
     @plugin_entry(
         id="tc_bridge",
         name="原生控制桥",
-        description="调用 tc_bridge.mod 的本地 TCP 控制口：status/run/stop/reset/place/undo/redo/save/components。",
+        description="调用 tc_bridge.mod 的本地 TCP 控制口（端口 bridge_port，默认 127.0.0.1:47654）：status/run/stop/reset/place/undo/redo/save/components。",
     )
     async def tc_bridge(
         self,

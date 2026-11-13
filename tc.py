@@ -16,9 +16,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +34,10 @@ STEAM_ROOTS = (
 )
 VDF_PATH_RE = re.compile(r'"path"\s+"([^"]+)"')
 NIM_LITERAL_RE = re.compile(r"`(.*)`", re.S)
+
+BRIDGE_HOST = "127.0.0.1"
+BRIDGE_PORT_DEFAULT = 47654
+BRIDGE_MAX_BYTES_DEFAULT = 2 * 1024 * 1024
 
 
 def now_stamp() -> str:
@@ -451,8 +457,76 @@ def is_game_running(exe: str = GAME_EXE) -> bool:
 # ---------------------------------------------------------------- self-check
 
 
+class BridgeError(ValueError):
+    """控制桥配置无效、应答超限或应答不是 JSON。"""
+
+
+def bridge_port(cfg: dict | None) -> int:
+    """配置项 bridge_port；缺省 47654，必须是 1-65535。"""
+    raw = (cfg or {}).get("bridge_port", BRIDGE_PORT_DEFAULT)
+    try:
+        port = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(f"bridge_port 不是有效端口：{raw!r}") from exc
+    if not 1 <= port <= 65535:
+        raise BridgeError(f"bridge_port 超出 1-65535：{port}")
+    return port
+
+
+def bridge_max_bytes(cfg: dict | None) -> int:
+    """配置项 bridge_max_bytes；应答字节上限，最小 1024。"""
+    raw = (cfg or {}).get("bridge_max_bytes", BRIDGE_MAX_BYTES_DEFAULT)
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(f"bridge_max_bytes 不是有效字节数：{raw!r}") from exc
+    if limit < 1024:
+        raise BridgeError(f"bridge_max_bytes 太小（至少 1024）：{limit}")
+    return limit
+
+
+def bridge_request(
+    payload: dict,
+    *,
+    port: int = BRIDGE_PORT_DEFAULT,
+    timeout: float = 8.0,
+    max_bytes: int = BRIDGE_MAX_BYTES_DEFAULT,
+    token: str = "",
+) -> dict:
+    """往 127.0.0.1:port 发一行 JSON，读一行 JSON 应答。
+
+    token 非空时给请求加 token 字段；应答超过 max_bytes 立即断开报错。
+    连不上或超时按 OSError 抛出，由调用方转成插件错误。
+    """
+    msg = dict(payload)
+    if token:
+        msg["token"] = token
+    with socket.create_connection((BRIDGE_HOST, port), timeout=timeout) as sock:
+        sock.sendall((json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+        parts = []
+        total = 0
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise BridgeError(f"控制桥应答超过 {max_bytes} 字节上限，已断开")
+            parts.append(chunk)
+            if chunk.endswith(b"\n"):
+                break
+    data = b"".join(parts)
+    if not data:
+        raise BridgeError("控制桥返回空应答")
+    try:
+        return json.loads(data.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"控制桥返回了非 JSON：{data[:200]!r}") from exc
+
+
 def _selftest() -> None:
     import tempfile
+    import threading
 
     assert nim_text("(31337_123, `AND Gate`)") == "AND Gate"
 
@@ -531,6 +605,79 @@ def _selftest() -> None:
                 raise AssertionError(f"campaign level {bad!r} 没被拒绝")
             except ValueError:
                 pass
+        assert bridge_port({}) == BRIDGE_PORT_DEFAULT and bridge_port({"bridge_port": "50000"}) == 50000
+        for bad_cfg in ({"bridge_port": "abc"}, {"bridge_port": 0}, {"bridge_port": 65536}):
+            try:
+                bridge_port(bad_cfg)
+                raise AssertionError(f"{bad_cfg} 的 bridge_port 没被拒绝")
+            except BridgeError:
+                pass
+        assert bridge_max_bytes({}) == BRIDGE_MAX_BYTES_DEFAULT
+        assert bridge_max_bytes({"bridge_max_bytes": 4096}) == 4096
+        try:
+            bridge_max_bytes({"bridge_max_bytes": 512})
+            raise AssertionError("过小的 bridge_max_bytes 没被拒绝")
+        except BridgeError:
+            pass
+
+        seen: list[dict] = []
+
+        def serve(response: bytes) -> int:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            srv_port = srv.getsockname()[1]
+
+            def run() -> None:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                finally:
+                    srv.close()
+                with conn:
+                    buf = b""
+                    while not buf.endswith(b"\n"):
+                        try:
+                            got = conn.recv(4096)
+                        except OSError:
+                            return
+                        if not got:
+                            break
+                        buf += got
+                    try:
+                        seen.append(json.loads(buf.decode("utf-8")))
+                    except json.JSONDecodeError:
+                        pass
+                    try:
+                        conn.sendall(response)
+                    except OSError:
+                        pass
+
+            threading.Thread(target=run, daemon=True).start()
+            return srv_port
+
+        port = serve(b'{"ok": true}\n')
+        assert bridge_request({"cmd": "status"}, port=port, timeout=5.0, token="s3cret") == {"ok": True}
+        assert seen[0]["cmd"] == "status" and seen[0]["token"] == "s3cret"
+        port = serve(b'{"ok": 1}\n')
+        assert bridge_request({"cmd": "ping"}, port=port, timeout=5.0) == {"ok": 1}
+        assert "token" not in seen[1]
+        port = serve(b'{"x": "' + b"A" * (3 * 1024 * 1024) + b'"}\n')
+        try:
+            bridge_request({"cmd": "components"}, port=port, timeout=5.0, max_bytes=1024 * 1024)
+            raise AssertionError("超限应答没有被拦下")
+        except BridgeError as exc:
+            assert "超过" in str(exc)
+        dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+        try:
+            bridge_request({"cmd": "ping"}, port=dead_port, timeout=1.0)
+            raise AssertionError("连接失败没有被报告")
+        except OSError:
+            pass
         print("selftest ok")
 
 

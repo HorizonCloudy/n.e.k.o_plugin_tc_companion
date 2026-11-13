@@ -42,13 +42,21 @@
 
 ## 原生控制桥（可选，默认不安装）
 
-`tc_bridge` 和 `tc_solve verify` 通过游戏内 mod 的本地 TCP 口 `127.0.0.1:47654` 工作。安装要改动游戏目录，所以默认关闭，需要在配置里写 `install_bridge = true`（且 `allow_write = true`）后重启插件。安装只在游戏未运行时进行，会：
+`tc_bridge` 和 `tc_solve verify` 通过游戏内 mod 的本地 TCP 口工作，默认 `127.0.0.1:47654`，端口可配置（见下）。安装要改动游戏目录，所以默认关闭，需要在配置里写 `install_bridge = true`（且 `allow_write = true`）后重启插件。安装只在游戏未运行时进行，会：
 
 1. 把 `<game>\game_engine.dll` 改名为 `tc_game_engine.dll`（原版引擎，哈希校验过），再把捆绑的代理加载器复制成 `game_engine.dll`；未知版本的 DLL 一律拒绝覆盖；
 2. 把 `local.tc-bridge.mod` 复制到 `<game>\mods\`；
 3. 运行捆绑的 `tcmod-cli.exe <game> enable local.tc-bridge`。
 
 卸载：退出游戏 → 删除 `<game>\game_engine.dll` → 把 `tc_game_engine.dll` 改回 `game_engine.dll` → 删除 `<game>\mods\local.tc-bridge.mod`。也可以在 Steam 里「验证游戏文件完整性」恢复原版引擎。
+
+### 桥的通信配置
+
+| 配置项 | 默认 | 作用 |
+|---|---|---|
+| `bridge_port` | `47654` | 插件连接的控制桥端口。捆绑的 mod 固定监听 47654，只有 mod 侧同步改过端口才需要改这里。 |
+| `bridge_token` | `""`（不发送） | 非空时插件在每个请求里加 `token` 字段。捆绑的 mod 会忽略该字段，只有换用会校验令牌的 mod 时才有实际门禁。 |
+| `bridge_max_bytes` | `2097152` | 应答字节上限（2 MiB）。超限立即断开并报错，防止失控应答耗尽内存。 |
 
 ## 游戏验证（`verify_game`）
 
@@ -77,3 +85,7 @@ python tc.py
 - `level` 与 `schematic` 只接受单层目录名，带 `/`、`\`、`..` 或控制字符会被拒绝；拼出的路径必须仍在 `schematics`/`campaign` 目录内。
 - 启动时若未开启 `install_bridge`，`tc_status` 会显示只读探测结果（引擎状态、有没有可用加载器、备份是否完好）。
 
+## 更新记录（2026-11-14）
+
+- 控制桥加固：端口（`bridge_port`）、令牌（`bridge_token`）、应答字节上限（`bridge_max_bytes`）改为可配置；超限应答立即断开报错，不再无上限累积。
+- `tc_status` 新增 `bridge_port` 和 `bridge_token_set`，一眼看出连的是哪个端口、有没有配令牌。

@@ -42,6 +42,15 @@ allow_write = true
 # 只在游戏未运行时安装；卸载方法见 README。
 install_bridge = false
 
+# 控制桥连接端口，默认 47654。捆绑的 mod 固定监听这个端口；只有 mod 侧同步改过端口才需要改这里，否则连不上桥。
+bridge_port = 47654
+
+# 控制桥令牌，默认空 = 不发送。非空时每个请求会加 "token" 字段；捆绑的 mod 会忽略该字段，只有换用会校验令牌的 mod 时才有实际门禁。
+bridge_token = ""
+
+# 控制桥应答字节上限。超限立即断开并报错，防止失控应答耗尽内存。
+bridge_max_bytes = 2097152
+
 # 游戏验证：auto = 检测到游戏安装才开；on；off。
 # 开启时写入（含控制桥 save 后的 circuit.data）会回读校验，tc_solve action=verify 会经控制桥跑关卡并对比 levels.txt 的完成/分数。
 verify_game = "auto"
