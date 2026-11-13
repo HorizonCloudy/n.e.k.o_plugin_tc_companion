@@ -1,6 +1,7 @@
 """Bundled mod installer for tc_companion.
 
-Runs from the plugin startup hook. Detects the game, matches the EXE against
+Runs from the plugin startup hook, but only when the user opted in with
+``install_bridge = true`` (and ``allow_write = true``). Detects the game, matches the EXE against
 the bundled loader variants, installs or updates the loader, copies the bridge
 mod, and enables it through the loader's CLI.
 """

@@ -24,11 +24,13 @@ from datetime import datetime
 from pathlib import Path
 
 GAME_EXE = "Turing Complete.exe"
-STEAM_CANDIDATES = (
-    r"E:\Program Files (x86)\Steam\steamapps\common\Turing Complete",
-    r"C:\Program Files (x86)\Steam\steamapps\common\Turing Complete",
-    r"D:\SteamLibrary\steamapps\common\Turing Complete",
+# 没有 libraryfolders.vdf 时的兜底库根目录；有 vdf 就以 vdf 为准。
+STEAM_ROOTS = (
+    r"E:\Program Files (x86)\Steam",
+    r"C:\Program Files (x86)\Steam",
+    r"D:\SteamLibrary",
 )
+VDF_PATH_RE = re.compile(r'"path"\s+"([^"]+)"')
 NIM_LITERAL_RE = re.compile(r"`(.*)`", re.S)
 
 
@@ -53,11 +55,46 @@ def resolve_game_dir(cfg: dict | None = None) -> Path | None:
     raw = str((cfg or {}).get("game_dir") or "").strip()
     if raw:
         return Path(raw)
-    for candidate in STEAM_CANDIDATES:
-        path = Path(candidate)
-        if (path / "Turing Complete.exe").exists():
+    for lib in steam_libraries():
+        path = lib / "steamapps" / "common" / "Turing Complete"
+        if (path / GAME_EXE).exists():
             return path
     return None
+
+
+def vdf_library_paths(text: str) -> list[Path]:
+    """libraryfolders.vdf 里每个库的 "path"（反斜杠是转义过的）。"""
+    return [Path(raw.replace("\\\\", "\\")) for raw in VDF_PATH_RE.findall(text or "")]
+
+
+def steam_libraries() -> list[Path]:
+    """注册表 SteamPath + 兜底根目录，再展开各自 libraryfolders.vdf 里的库。"""
+    roots = [Path(r) for r in STEAM_ROOTS]
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+            roots.insert(0, Path(winreg.QueryValueEx(key, "SteamPath")[0]))
+    except (ImportError, OSError):
+        pass
+    libs: list[Path] = []
+    for root in roots:
+        try:
+            text = (root / "steamapps" / "libraryfolders.vdf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for lib in [root, *vdf_library_paths(text)]:
+            if lib not in libs:
+                libs.append(lib)
+    return libs
+
+
+def verify_enabled(cfg: dict | None, game: Path | None) -> bool:
+    """verify_game：auto = 检测到游戏安装才开；on / off 强制开关。"""
+    mode = str((cfg or {}).get("verify_game", "auto")).strip().lower()
+    if mode == "auto":
+        return bool(game and (Path(game) / GAME_EXE).exists())
+    return mode in ("on", "true")
 
 
 # ------------------------------------------------------------------ settings
@@ -229,7 +266,7 @@ def circuit_info(path: Path) -> dict:
     }
 
 
-def deploy_circuit(src: Path, dst_dir: Path) -> dict:
+def deploy_circuit(src: Path, dst_dir: Path, verify: bool = False) -> dict:
     src = Path(src)
     if src.name != "circuit.data" or not src.exists():
         raise FileNotFoundError(f"源电路不存在：{src}")
@@ -240,10 +277,14 @@ def deploy_circuit(src: Path, dst_dir: Path) -> dict:
     if dst.exists():
         backup = dst.with_name(f"{dst.name}.tc-bak-{now_stamp()}")
         shutil.copy2(dst, backup)
+    data = src.read_bytes()
     tmp = dst.with_name(".circuit.data.tmp")
-    tmp.write_bytes(src.read_bytes())
+    tmp.write_bytes(data)
     os.replace(tmp, dst)
-    return {"source": str(src), "target": str(dst), "backup": str(backup) if backup else None}
+    out = {"source": str(src), "target": str(dst), "backup": str(backup) if backup else None}
+    if verify:
+        out["verified"] = dst.read_bytes() == data
+    return out
 
 
 # --------------------------------------------------------------------- code
@@ -262,7 +303,7 @@ def read_code(sdir: Path, name: str) -> str:
     return code_path(sdir, name).read_text(encoding="utf-8", errors="replace")
 
 
-def write_code(sdir: Path, name: str, code: str) -> dict:
+def write_code(sdir: Path, name: str, code: str, verify: bool = False) -> dict:
     path = code_path(sdir, name)
     if len(code.encode("utf-8")) > 500_000:
         raise ValueError("文件超过 500KB，拒绝写入")
@@ -274,7 +315,10 @@ def write_code(sdir: Path, name: str, code: str) -> dict:
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
-    return {"file": path.name, "bytes": len(text.encode("utf-8")), "backup": str(backup) if backup else None}
+    out = {"file": path.name, "bytes": len(text.encode("utf-8")), "backup": str(backup) if backup else None}
+    if verify:
+        out["verified"] = path.read_text(encoding="utf-8") == text
+    return out
 
 
 def parse_isa(text: str) -> dict:
@@ -418,10 +462,10 @@ def _selftest() -> None:
 
         info = circuit_info(src / "circuit.data")
         assert info["version"] == 15 and "Input" in info["strings"]
-        assert write_code(src, "spec.isa", isa_text)["bytes"] > 0
+        assert write_code(src, "spec.isa", isa_text, verify=True)["verified"]
         assert read_code(src, "spec.isa") == isa_text
-        moved = deploy_circuit(src / "circuit.data", dst)
-        assert moved["backup"] and (dst / "circuit.data").read_bytes().startswith(b"\x0f")
+        moved = deploy_circuit(src / "circuit.data", dst, verify=True)
+        assert moved["backup"] and moved["verified"] and (dst / "circuit.data").read_bytes().startswith(b"\x0f")
         assert list_schematics(user)
 
         manual = manual_dir(game) / "Circuits" / "Delay"
@@ -431,6 +475,12 @@ def _selftest() -> None:
         docs = list_docs(game)
         assert docs[0]["title"] == "Delay" and "delay" in docs[0]["doc"].lower()
         assert find_doc(docs, "delay")["path"] == "Circuits/Delay"
+
+        vdf = '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"E:\\\\Steam"\n\t}\n\t"1"\n\t{\n\t\t"path"\t\t"F:\\\\Lib"\n\t}\n}\n'
+        assert vdf_library_paths(vdf) == [Path(r"E:\Steam"), Path(r"F:\Lib")]
+        (game / GAME_EXE).write_bytes(b"")
+        assert verify_enabled({}, game) and verify_enabled({"verify_game": "on"}, None)
+        assert not verify_enabled({"verify_game": "off"}, game) and not verify_enabled({}, root / "nope")
         print("selftest ok")
 
 

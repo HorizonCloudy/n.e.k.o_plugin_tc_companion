@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -76,6 +77,13 @@ class TcCompanionPlugin(NekoPluginBase):
             folder = folder.parent
         return sdir
 
+    @staticmethod
+    def _check_write(cfg: dict) -> None:
+        if not bool(cfg.get("allow_write", True)):
+            raise SdkError("配置里 allow_write=false，已拒绝写盘")
+        if tc.is_game_running():
+            raise SdkError("游戏正在运行；关卡打开时会覆盖文件，请先退出游戏")
+
     # --------------------------------------------------------------------- ops
 
     async def _status(self) -> dict:
@@ -85,6 +93,10 @@ class TcCompanionPlugin(NekoPluginBase):
         out = {
             "user_dir": str(user),
             "game_dir": str(game) if game else None,
+            "game_exe_present": bool(game and (game / tc.GAME_EXE).exists()),
+            "bridge_installed": bool(
+                game and (game / "tc_game_engine.dll").exists() and (game / "mods" / "local.tc-bridge.mod").exists()
+            ),
             "game_running": tc.is_game_running(),
             "current_level": current,
             "architecture": settings.get("setting_loaded_architecture", ""),
@@ -94,11 +106,14 @@ class TcCompanionPlugin(NekoPluginBase):
             "schematics": len(tc.list_schematics(user)),
             "manual_available": bool(game and tc.manual_dir(game).exists()),
             "allow_write": bool(cfg.get("allow_write", True)),
+            "install_bridge": bool(cfg.get("install_bridge", False)),
+            "verify_game": str(cfg.get("verify_game", "auto")),
+            "verify": tc.verify_enabled(cfg, game),
             "install": self._install_result,
         }
         if out["game_running"]:
             try:
-                out["bridge"] = self._bridge({"cmd": "status"}, timeout=1.5)
+                out["bridge"] = await asyncio.to_thread(self._bridge, {"cmd": "status"}, 1.5)
             except SdkError as exc:
                 out["bridge_error"] = str(exc)
         return out
@@ -136,7 +151,7 @@ class TcCompanionPlugin(NekoPluginBase):
         raise SdkError(f"未知 action：{action}")
 
     async def _code_op(self, action: str = "list", file: str = "", code: str = "", level: str = "", schematic: str = "") -> dict:
-        cfg, user, _, settings = await self._ctx()
+        cfg, user, game, settings = await self._ctx()
         sdir = self._schematic(user, settings, level, schematic)
         action = (action or "list").strip().lower()
 
@@ -157,11 +172,8 @@ class TcCompanionPlugin(NekoPluginBase):
         if action == "read":
             return {"file": file, "code": tc.read_code(self._code_dir(sdir, file), file)}
         if action == "write":
-            if not bool(cfg.get("allow_write", True)):
-                raise SdkError("配置里 allow_write=false，已拒绝写盘")
-            if tc.is_game_running():
-                raise SdkError("游戏正在运行；关卡打开时会覆盖文件，请先退出游戏")
-            return tc.write_code(self._code_dir(sdir, file), file, code)
+            self._check_write(cfg)
+            return tc.write_code(self._code_dir(sdir, file), file, code, verify=tc.verify_enabled(cfg, game))
         if action == "validate":
             isa_dir = self._code_dir(sdir, "spec.isa")
             isa_text = tc.read_code(isa_dir, "spec.isa")
@@ -177,7 +189,7 @@ class TcCompanionPlugin(NekoPluginBase):
         raise SdkError(f"未知 action：{action}")
 
     async def _circuit_op(self, action: str = "list", level: str = "", schematic: str = "", source_level: str = "", source_schematic: str = "") -> dict:
-        cfg, user, _, settings = await self._ctx()
+        cfg, user, game, settings = await self._ctx()
         action = (action or "list").strip().lower()
 
         if action == "list":
@@ -189,15 +201,12 @@ class TcCompanionPlugin(NekoPluginBase):
                 raise SdkError(f"没有电路文件：{path}")
             return tc.circuit_info(path)
         if action == "deploy":
-            if not bool(cfg.get("allow_write", True)):
-                raise SdkError("配置里 allow_write=false，已拒绝写盘")
-            if tc.is_game_running():
-                raise SdkError("游戏正在运行；请先退出游戏再部署电路")
+            self._check_write(cfg)
             if not source_level:
                 raise SdkError("deploy 需要 source_level")
             src = self._schematic(user, settings, source_level, source_schematic) / "circuit.data"
             dst = self._schematic(user, settings, level, schematic)
-            return tc.deploy_circuit(src, dst)
+            return tc.deploy_circuit(src, dst, verify=tc.verify_enabled(cfg, game))
         raise SdkError(f"未知 action：{action}")
 
     async def _accept_op(self, action: str = "check", level: str = "") -> dict:
@@ -254,7 +263,22 @@ class TcCompanionPlugin(NekoPluginBase):
         allowed = {"status", "ping", "run", "stop", "reset", "undo", "redo", "save", "place", "components"}
         if action not in allowed:
             raise SdkError(f"未知 action：{action}")
-        return self._bridge({"cmd": action, **extra})
+        if action in {"place", "undo", "redo", "save", "reset"} and not bool((await self._cfg()).get("allow_write", True)):
+            raise SdkError("配置里 allow_write=false，已拒绝通过控制桥改动游戏")
+        circuit = None
+        if action == "save":
+            cfg, user, game, settings = await self._ctx()
+            if tc.verify_enabled(cfg, game):
+                circuit = self._schematic(user, settings) / "circuit.data"
+                before = circuit.stat().st_mtime if circuit.exists() else 0.0
+        reply = await asyncio.to_thread(self._bridge, {"cmd": action, **extra})
+        if circuit is not None:
+            # 回读：circuit.data 的 mtime 变了才算真的存了盘；存档名按 levels.txt 推断
+            deadline = time.monotonic() + 3.0
+            while not (saved := circuit.exists() and circuit.stat().st_mtime != before) and time.monotonic() < deadline:
+                await asyncio.sleep(0.25)
+            reply = {**reply, "verified": saved, "circuit": str(circuit)}
+        return reply
 
     async def _solve_op(
         self,
@@ -262,6 +286,8 @@ class TcCompanionPlugin(NekoPluginBase):
         file: str = "new_program.asm",
         code: str = "",
         level: str = "",
+        cycles: int = 1000,
+        wait_seconds: float = 10.0,
     ) -> dict:
         cfg, user, game, settings = await self._ctx()
         level = level or settings.get("setting_current_level") or ""
@@ -270,7 +296,7 @@ class TcCompanionPlugin(NekoPluginBase):
         if action == "context":
             info = tc.level_info(game, level) if game else {}
             try:
-                bridge = self._bridge({"cmd": "status"}, timeout=1.5)
+                bridge = await asyncio.to_thread(self._bridge, {"cmd": "status"}, 1.5)
             except SdkError:
                 bridge = None
             files = {}
@@ -286,17 +312,40 @@ class TcCompanionPlugin(NekoPluginBase):
                 "test": (info.get("test.si") or "")[:4000],
                 "files": files,
                 "bridge": bridge,
-                "hint": "先看 test 和 bridge；写 tc_solve action=apply file=new_program.asm code=...，插件会校验并返回结果。",
+                "hint": "先看 test 和 bridge；退出游戏后用 tc_solve action=apply file=new_program.asm code=... 写入并校验；"
+                "再自己打开游戏进入该关卡，用 action=verify 让控制桥跑一遍并对比 levels.txt。",
+                "verify": tc.verify_enabled(cfg, game),
             }
         if action == "apply":
             if not code:
                 raise SdkError("apply 需要 code")
-            written = tc.write_code(self._code_dir(sdir, file), file, code)
+            self._check_write(cfg)
+            written = tc.write_code(self._code_dir(sdir, file), file, code, verify=tc.verify_enabled(cfg, game))
             isa = tc.parse_isa(tc.read_code(self._code_dir(sdir, "spec.isa"), "spec.isa"))
             asm_text = code if file == "new_program.asm" else (
                 tc.read_code(sdir, "new_program.asm") if (sdir / "new_program.asm").exists() else ""
             )
             return {"written": written, "validation": tc.validate_asm(asm_text, isa)}
+        if action == "verify":
+            if not tc.verify_enabled(cfg, game):
+                raise SdkError("游戏验证未开启（verify_game=off，或 auto 但没检测到游戏安装）")
+            if not tc.is_game_running():
+                raise SdkError("游戏没在运行：请自己打开游戏并进入该关卡后再 verify（插件不会替你启动游戏）")
+            before = tc.level_progress(tc.read_levels(user), level)
+            run = await asyncio.to_thread(self._bridge, {"cmd": "run", "cycles": int(cycles)})
+            if run.get("ok") is False:
+                raise SdkError(f"控制桥 run 失败：{run.get('error')}")
+            after, deadline = before, time.monotonic() + min(max(float(wait_seconds), 1.0), 25.0)
+            while after == before and time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                after = tc.level_progress(tc.read_levels(user), level)
+            if after != before and after and after["done"]:
+                verdict = "passed"
+            elif before and before["done"]:
+                verdict = "already_done"  # levels.txt 没变：存档里看不出这一次是否通过
+            else:
+                verdict = "not_passed"
+            return {"level": level, "verdict": verdict, "before": before, "after": after, "run": run}
         raise SdkError(f"未知 action：{action}")
 
     # ----------------------------------------------------------------- entries
@@ -404,18 +453,21 @@ class TcCompanionPlugin(NekoPluginBase):
     @plugin_entry(
         id="tc_solve",
         name="自动写码闭环",
-        description="context=当前关卡/测试/代码/棋盘；apply=写 ISA 或汇编并校验。",
+        description="context=当前关卡/测试/代码/棋盘；apply=写 ISA 或汇编并校验（需退出游戏）；"
+        "verify=游戏运行时经控制桥跑关卡，并对比 levels.txt 的完成/分数。",
     )
     async def tc_solve(
         self,
-        action: Annotated[str, "context / apply"] = "context",
+        action: Annotated[str, "context / apply / verify"] = "context",
         file: Annotated[str, "spec.isa 或 new_program.asm"] = "new_program.asm",
         code: Annotated[str, "apply 时的完整内容"] = "",
         level: Annotated[str, "关卡 id；留空用当前关卡"] = "",
+        cycles: Annotated[int, "verify：跑多少个周期"] = 1000,
+        wait_seconds: Annotated[float, "verify：最多等 levels.txt 变化多少秒（1-25）"] = 10.0,
         **_,
     ):
         try:
-            return Ok(await self._solve_op(action, file, code, level))
+            return Ok(await self._solve_op(action, file, code, level, cycles, wait_seconds))
         except SdkError as exc:
             return Err(exc)
         except Exception as exc:
@@ -564,20 +616,32 @@ class TcCompanionPlugin(NekoPluginBase):
 
     @llm_tool(
         name="tc_solve",
-        description="《Turing Complete》自动写码闭环：context 读关卡测试/代码/棋盘，apply 写 ISA 或汇编并校验。",
+        description="《Turing Complete》自动写码闭环：context 读关卡测试/代码/棋盘，apply 写 ISA 或汇编并校验（需退出游戏），"
+        "verify 在游戏运行时经控制桥跑关卡并对比 levels.txt 完成/分数。",
         parameters={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["context", "apply"]},
+                "action": {"type": "string", "enum": ["context", "apply", "verify"]},
                 "file": {"type": "string"},
                 "code": {"type": "string"},
                 "level": {"type": "string"},
+                "cycles": {"type": "integer", "description": "verify 跑的周期数，默认 1000"},
+                "wait_seconds": {"type": "number", "description": "verify 最多等多少秒，默认 10"},
             },
         },
     )
-    async def tool_solve(self, *, action: str = "context", file: str = "new_program.asm", code: str = "", level: str = ""):
+    async def tool_solve(
+        self,
+        *,
+        action: str = "context",
+        file: str = "new_program.asm",
+        code: str = "",
+        level: str = "",
+        cycles: int = 1000,
+        wait_seconds: float = 10.0,
+    ):
         try:
-            return {"output": await self._solve_op(action, file, code, level)}
+            return {"output": await self._solve_op(action, file, code, level, cycles, wait_seconds)}
         except SdkError as exc:
             return {"output": {"reason": str(exc)}, "is_error": True, "error": "TC_SOLVE_REJECTED"}
         except Exception as exc:
@@ -588,10 +652,14 @@ class TcCompanionPlugin(NekoPluginBase):
     @lifecycle(id="startup")
     async def on_startup(self, **_):
         cfg, user, game, settings = await self._ctx()
-        try:
-            self._install_result = await asyncio.to_thread(tc_install.install, cfg)
-        except Exception as exc:
-            self._install_result = {"ok": False, "stage": "error", "reason": f"{type(exc).__name__}: {exc}"}
+        # 安装会替换 <game>/game_engine.dll，必须由用户在配置里显式同意
+        if not (bool(cfg.get("install_bridge", False)) and bool(cfg.get("allow_write", True))):
+            self._install_result = {"ok": False, "stage": "disabled", "reason": "install_bridge=false 或 allow_write=false，未改动游戏目录"}
+        else:
+            try:
+                self._install_result = await asyncio.to_thread(tc_install.install, cfg)
+            except Exception as exc:
+                self._install_result = {"ok": False, "stage": "error", "reason": f"{type(exc).__name__}: {exc}"}
         return Ok({
             "status": "ready",
             "current_level": settings.get("setting_current_level", ""),

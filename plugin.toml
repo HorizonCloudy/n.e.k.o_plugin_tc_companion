@@ -1,7 +1,7 @@
 [plugin]
 id = "tc_companion"
 name = "图灵完备助手"
-description = "《Turing Complete》陪玩插件：读取游戏内置手册与关卡测试定义，读写 spec.isa / new_program.asm 并做指令集校验，检查与部署电路存档（circuit.data），按 levels.txt 做验收。电路是版本化二进制，插件采用模板/存档复制而不是凭空生成元件；每次写文件前自动备份。"
+description = "《Turing Complete》陪玩插件：读取游戏内置手册与关卡测试定义，读写 spec.isa / new_program.asm 并做指令集校验，检查与部署电路存档（circuit.data），按 levels.txt 做验收。编辑 circuit.data 只做整份复制、不改二进制；可选的原生控制桥（tc_bridge mod，TCP 127.0.0.1:47654）能在运行中的游戏里跑仿真、放元件，安装它会替换游戏目录的 game_engine.dll，默认关闭，需在配置里显式开启 install_bridge。每次写文件前自动备份。"
 short_description = "Companion for Turing Complete: manual + level tests, ISA/assembly editing with validation, circuit archive inspection/deployment, progress acceptance."
 keywords = [
     "Turing Complete",
@@ -34,5 +34,14 @@ user_dir = ""
 # 游戏安装目录。留空 = 自动探测常见 Steam 路径
 game_dir = ""
 
-# 写代码 / 部署电路开关
+# 写盘总开关：写代码、部署电路、控制桥的 place/undo/redo/save/reset 都受它约束
 allow_write = true
+
+# 安装原生控制桥（默认关，需显式同意）。开启后插件启动时会：把 <game>/game_engine.dll 换成代理加载器
+# （原版保留为 tc_game_engine.dll）、把 local.tc-bridge.mod 复制到 <game>/mods、并运行 tcmod-cli.exe enable。
+# 只在游戏未运行时安装；卸载方法见 README。
+install_bridge = false
+
+# 游戏验证：auto = 检测到游戏安装才开；on；off。
+# 开启时写入（含控制桥 save 后的 circuit.data）会回读校验，tc_solve action=verify 会经控制桥跑关卡并对比 levels.txt 的完成/分数。
+verify_game = "auto"
