@@ -194,8 +194,34 @@ def find_doc(docs: list[dict], key: str) -> dict | None:
 # --------------------------------------------------------------- level files
 
 
+BAD_PATH_CHARS = set('/\\:*?"<>|')
+
+
+def safe_component(value: str, kind: str) -> str:
+    """关卡 id 和电路图名只能是一层目录名，不允许带路径。"""
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError(f"{kind} 不能为空")
+    if raw in (".", "..") or any(ch in BAD_PATH_CHARS for ch in raw):
+        raise ValueError(f"{kind} 非法：{value!r}（不能带路径分隔符或 ..）")
+    if any(ord(ch) < 32 for ch in raw) or len(raw) > 80:
+        raise ValueError(f"{kind} 非法：{value!r}（控制字符或过长）")
+    return raw
+
+
+def under(root: Path, target: Path, kind: str) -> Path:
+    """确认 target 仍在 root 里面，防止拼出预期目录之外的路径。"""
+    base = Path(root).resolve()
+    resolved = Path(target).resolve()
+    if resolved != base and base not in resolved.parents:
+        raise ValueError(f"{kind} 越出预期目录：{resolved}")
+    return resolved
+
+
 def campaign_dir(game: Path, level: str) -> Path:
-    return Path(game) / "campaign" / level
+    root = Path(game) / "campaign"
+    folder = root / safe_component(level, "level")
+    return under(root, folder, "level")
 
 
 def level_info(game: Path, level: str) -> dict:
@@ -220,7 +246,9 @@ def level_info(game: Path, level: str) -> dict:
 
 
 def schematic_dir(user: Path, level: str, name: str = "Default") -> Path:
-    return Path(user) / "schematics" / level / (name or "Default")
+    root = Path(user) / "schematics"
+    folder = root / safe_component(level, "level") / safe_component(name or "Default", "schematic")
+    return under(root, folder, "schematic")
 
 
 def list_schematics(user: Path) -> list[dict]:
@@ -278,7 +306,7 @@ def deploy_circuit(src: Path, dst_dir: Path, verify: bool = False) -> dict:
         backup = dst.with_name(f"{dst.name}.tc-bak-{now_stamp()}")
         shutil.copy2(dst, backup)
     data = src.read_bytes()
-    tmp = dst.with_name(".circuit.data.tmp")
+    tmp = dst.with_name(f".circuit.data.tmp-{now_stamp()}")
     tmp.write_bytes(data)
     os.replace(tmp, dst)
     out = {"source": str(src), "target": str(dst), "backup": str(backup) if backup else None}
@@ -312,7 +340,7 @@ def write_code(sdir: Path, name: str, code: str, verify: bool = False) -> dict:
         backup = path.with_name(f"{path.name}.bak-{now_stamp()}")
         shutil.copy2(path, backup)
     text = (code or "").replace("\r\n", "\n").replace("\r", "\n")
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.tmp-{now_stamp()}")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
     out = {"file": path.name, "bytes": len(text.encode("utf-8")), "backup": str(backup) if backup else None}
@@ -481,6 +509,28 @@ def _selftest() -> None:
         (game / GAME_EXE).write_bytes(b"")
         assert verify_enabled({}, game) and verify_enabled({"verify_game": "on"}, None)
         assert not verify_enabled({"verify_game": "off"}, game) and not verify_enabled({}, root / "nope")
+    with tempfile.TemporaryDirectory() as gate:
+        base = Path(gate)
+        (base / "schematics").mkdir()
+        assert schematic_dir(base, "Basic_logic", "Default").parts[-2:] == ("Basic_logic", "Default")
+        for bad in ("..", "../x", "a/b", "a\\b", "", "x" * 90):
+            try:
+                schematic_dir(base, bad, "Default")
+                raise AssertionError(f"level {bad!r} 没被拒绝")
+            except ValueError:
+                pass
+        try:
+            schematic_dir(base, "ok", "..\\..\\evil")
+            raise AssertionError("schematic 越界没被拒绝")
+        except ValueError:
+            pass
+        (base / "campaign").mkdir()
+        for bad in ("..\\\\windows", ".."):
+            try:
+                campaign_dir(base, bad)
+                raise AssertionError(f"campaign level {bad!r} 没被拒绝")
+            except ValueError:
+                pass
         print("selftest ok")
 
 

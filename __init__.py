@@ -320,12 +320,20 @@ class TcCompanionPlugin(NekoPluginBase):
             if not code:
                 raise SdkError("apply 需要 code")
             self._check_write(cfg)
-            written = tc.write_code(self._code_dir(sdir, file), file, code, verify=tc.verify_enabled(cfg, game))
-            isa = tc.parse_isa(tc.read_code(self._code_dir(sdir, "spec.isa"), "spec.isa"))
+            isa_text = code if file.endswith(".isa") else tc.read_code(self._code_dir(sdir, "spec.isa"), "spec.isa")
+            isa = tc.parse_isa(isa_text)
+            isa_errors = list(isa.get("errors") or [])
+            if isa_errors:
+                raise SdkError(f"spec.isa 校验没通过，未写盘：{isa_errors[:5]}")
             asm_text = code if file == "new_program.asm" else (
                 tc.read_code(sdir, "new_program.asm") if (sdir / "new_program.asm").exists() else ""
             )
-            return {"written": written, "validation": tc.validate_asm(asm_text, isa)}
+            check = tc.validate_asm(asm_text, isa)
+            asm_errors = list(check.get("errors") or [])
+            if file.endswith(".asm") and asm_errors:
+                raise SdkError(f"汇编校验没通过，未写盘：{asm_errors[:5]}")
+            written = tc.write_code(self._code_dir(sdir, file), file, code, verify=tc.verify_enabled(cfg, game))
+            return {"written": written, "validation": check, "isa_errors": isa_errors}
         if action == "verify":
             if not tc.verify_enabled(cfg, game):
                 raise SdkError("游戏验证未开启（verify_game=off，或 auto 但没检测到游戏安装）")
@@ -647,6 +655,71 @@ class TcCompanionPlugin(NekoPluginBase):
         except Exception as exc:
             return {"output": {"reason": f"{type(exc).__name__}: {exc}"}, "is_error": True, "error": "TC_SOLVE_FAILED"}
 
+    async def _install_probe(self, cfg: dict) -> dict:
+        """只读检查游戏目录里的引擎状态，不改任何文件。"""
+        try:
+            return await asyncio.to_thread(tc_install.probe, cfg)
+        except Exception as exc:
+            return {"ok": False, "stage": "error", "reason": f"{type(exc).__name__}: {exc}", "changed": False}
+
+    async def _install_apply(self, cfg: dict, which: str = "install") -> dict:
+        fn = tc_install.restore if which == "restore" else tc_install.install
+        try:
+            return await asyncio.to_thread(fn, cfg)
+        except Exception as exc:
+            return {"ok": False, "stage": "error", "reason": f"{type(exc).__name__}: {exc}", "changed": True}
+
+    async def _install_op(self, action: str = "status", confirm: bool = False) -> dict:
+        cfg = await self._cfg()
+        action = (action or "status").strip().lower()
+        if action == "status":
+            return await self._install_probe(cfg)
+        if action not in ("install", "restore"):
+            raise SdkError(f"未知 action：{action}")
+        if not bool(cfg.get("allow_write", True)):
+            raise SdkError("配置里 allow_write=false，已拒绝改游戏目录")
+        if not confirm:
+            raise SdkError(f"{action} 会改图灵完备的游戏目录，请显式传 confirm=true")
+        self._install_result = await self._install_apply(cfg, action)
+        return self._install_result
+
+    @plugin_entry(
+        id="tc_install",
+        name="加载器安装",
+        description="status=只读检查 game_engine.dll 状态；install=装控制桥加载器；restore=换回原版引擎。install/restore 要显式 confirm=true。",
+    )
+    async def tc_install_entry(
+        self,
+        action: Annotated[str, "status / install / restore"] = "status",
+        confirm: Annotated[bool, "改游戏目录的确认位"] = False,
+        **_,
+    ):
+        try:
+            return Ok(await self._install_op(action, confirm))
+        except SdkError as exc:
+            return Err(exc)
+        except Exception as exc:
+            return Err(SdkError(f"{type(exc).__name__}: {exc}"))
+
+    @llm_tool(
+        name="tc_install",
+        description="检查或显式安装/还原《Turing Complete》的 mod 加载器（会替换 game_engine.dll）。install/restore 需要 confirm=true。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["status", "install", "restore"]},
+                "confirm": {"type": "boolean", "description": "显式确认后才会改游戏目录"},
+            },
+        },
+    )
+    async def tool_install(self, *, action: str = "status", confirm: bool = False):
+        try:
+            return {"output": await self._install_op(action, confirm)}
+        except SdkError as exc:
+            return {"output": {"reason": str(exc)}, "is_error": True, "error": "TC_INSTALL_REJECTED"}
+        except Exception as exc:
+            return {"output": {"reason": f"{type(exc).__name__}: {exc}"}, "is_error": True, "error": "TC_INSTALL_FAILED"}
+
     # -------------------------------------------------------------- lifecycle
 
     @lifecycle(id="startup")
@@ -654,7 +727,12 @@ class TcCompanionPlugin(NekoPluginBase):
         cfg, user, game, settings = await self._ctx()
         # 安装会替换 <game>/game_engine.dll，必须由用户在配置里显式同意
         if not (bool(cfg.get("install_bridge", False)) and bool(cfg.get("allow_write", True))):
-            self._install_result = {"ok": False, "stage": "disabled", "reason": "install_bridge=false 或 allow_write=false，未改动游戏目录"}
+            self._install_result = {
+                **(await self._install_probe(cfg)),
+                "ok": False,
+                "stage": "disabled",
+                "reason": "install_bridge=false 或 allow_write=false，未改动游戏目录",
+            }
         else:
             try:
                 self._install_result = await asyncio.to_thread(tc_install.install, cfg)

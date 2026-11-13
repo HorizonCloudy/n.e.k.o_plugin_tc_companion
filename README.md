@@ -68,3 +68,12 @@
 ```powershell
 python tc.py
 ```
+
+## 更新记录（2026-11-13）
+
+- 新增 `tc_install` 入口：`status` 只读检查 `game_engine.dll` 状态，`install` 装加载器，`restore` 换回原版引擎；`install`/`restore` 需要 `allow_write=true` 且显式 `confirm=true`。
+- DLL 与 mod 改为临时文件 + 哈希校验 + 原子替换，失败时原文件保持原样；覆盖同名 mod 前自动备份。
+- `tc_solve action=apply` 先校验 spec.isa 和汇编，有错误就不写盘（原来的顺序是先写后校验）。
+- `level` 与 `schematic` 只接受单层目录名，带 `/`、`\`、`..` 或控制字符会被拒绝；拼出的路径必须仍在 `schematics`/`campaign` 目录内。
+- 启动时若未开启 `install_bridge`，`tc_status` 会显示只读探测结果（引擎状态、有没有可用加载器、备份是否完好）。
+

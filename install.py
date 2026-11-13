@@ -32,6 +32,107 @@ def _manifest() -> dict:
     return json.loads((BUNDLE / "manifest.json").read_text(encoding="utf-8"))
 
 
+def _atomic_copy(src: Path, dst: Path) -> None:
+    """先写临时文件并校验哈希，再原子替换。失败时 dst 保持原样，不会留下半截 DLL。"""
+    dst = Path(dst)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}-{tc.now_stamp()}")
+    try:
+        shutil.copy2(src, tmp)
+        if _sha256(tmp).lower() != _sha256(src).lower():
+            raise OSError(f"复制后哈希不匹配：{tmp}")
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _locate(cfg: dict) -> tuple[Path, Path, Path, Path, dict]:
+    """返回 (游戏目录, exe, engine, backup, manifest)；找不到时抛错。"""
+    manifest = _manifest()
+    game = tc.resolve_game_dir(cfg)
+    if not game:
+        raise FileNotFoundError("找不到 Turing Complete 安装目录")
+    exe = game / "Turing Complete.exe"
+    engine = game / "game_engine.dll"
+    backup = game / "tc_game_engine.dll"
+    if not exe.exists() or not engine.exists():
+        raise FileNotFoundError(f"游戏文件不全：{game}")
+    return game, exe, engine, backup, manifest
+
+
+def _loader_for(manifest: dict, exe_hash: str) -> dict | None:
+    return next(
+        (item for item in manifest.get("loaders", []) if item.get("exe_sha256", "").lower() == exe_hash),
+        None,
+    )
+
+
+def probe(cfg: dict) -> dict:
+    """只读检查：引擎现在是原版、已装加载器，还是认不出来。不写任何文件。"""
+    try:
+        game, exe, engine, backup, manifest = _locate(cfg)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"ok": False, "stage": "detect", "reason": f"{type(exc).__name__}: {exc}", "changed": False}
+    exe_hash = _sha256(exe).lower()
+    variant = _loader_for(manifest, exe_hash)
+    original = manifest["engine_sha256"].lower()
+    bundled = {item["sha256"].lower() for item in manifest.get("loaders", [])}
+    engine_hash = _sha256(engine).lower()
+    if engine_hash == original:
+        state = "original"
+    elif variant is not None and engine_hash == variant["sha256"].lower():
+        state = "installed"
+    elif engine_hash in bundled:
+        state = "installed_other_variant"
+    else:
+        state = "unknown"
+    return {
+        "ok": True,
+        "stage": "probe",
+        "changed": False,
+        "game": str(game),
+        "game_running": tc.is_game_running(str(cfg.get("game_exe") or "Turing Complete.exe")),
+        "game_version": (variant or {}).get("game"),
+        "loader_file": (variant or {}).get("file"),
+        "loader_available": variant is not None,
+        "exe_sha256": exe_hash,
+        "engine_sha256": engine_hash,
+        "engine_state": state,
+        "backup_exists": backup.exists(),
+        "backup_is_original": bool(backup.exists() and _sha256(backup).lower() == original),
+    }
+
+
+def restore(cfg: dict) -> dict:
+    """把原版 game_engine.dll 换回来。只在游戏退出后执行。"""
+    try:
+        game, _exe, engine, backup, manifest = _locate(cfg)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"ok": False, "stage": "detect", "reason": f"{type(exc).__name__}: {exc}", "changed": False}
+    if not backup.exists():
+        return {"ok": False, "stage": "detect", "reason": f"没有备份 {backup.name}", "game": str(game), "changed": False}
+    if tc.is_game_running(str(cfg.get("game_exe") or "Turing Complete.exe")):
+        return {"ok": False, "stage": "busy", "reason": "游戏正在运行；请先退出游戏", "changed": False}
+    original = manifest["engine_sha256"].lower()
+    if _sha256(backup).lower() != original:
+        return {"ok": False, "stage": "backup", "reason": "tc_game_engine.dll 不是原版引擎，不敢覆盖回去", "changed": False}
+    try:
+        os.replace(backup, engine)
+    except OSError as exc:
+        return {"ok": False, "stage": "restore", "reason": f"{type(exc).__name__}: {exc}", "changed": True}
+    return {
+        "ok": True,
+        "stage": "restored",
+        "changed": True,
+        "game": str(game),
+        "engine_sha256": _sha256(engine).lower(),
+        "note": "mods 目录下的 local.tc-bridge.mod 保留；换回原版引擎后它不会再被加载",
+    }
+
+
 def _enable(game: Path, cli: Path, mod_id: str) -> dict:
     if not cli.exists():
         return {"ok": False, "error": f"缺少 {cli.name}"}
@@ -94,7 +195,7 @@ def install(cfg: dict) -> dict:
         action = "already"
     elif engine_hash in bundled:
         try:
-            shutil.copy2(loader, engine)
+            _atomic_copy(loader, engine)
             action = "updated"
         except OSError as exc:
             return {"ok": False, "stage": "update", "reason": f"{type(exc).__name__}: {exc}"}
@@ -102,7 +203,7 @@ def install(cfg: dict) -> dict:
         # An older loader is installed; the original engine is safely kept in
         # tc_game_engine.dll, so replacing the proxy is a normal update.
         try:
-            shutil.copy2(loader, engine)
+            _atomic_copy(loader, engine)
             action = "updated"
         except OSError as exc:
             return {"ok": False, "stage": "update", "reason": f"{type(exc).__name__}: {exc}"}
@@ -114,7 +215,7 @@ def install(cfg: dict) -> dict:
                 os.replace(engine, backup)
             else:
                 engine.unlink()
-            shutil.copy2(loader, engine)
+            _atomic_copy(loader, engine)
             action = "installed"
         except OSError as exc:
             try:
@@ -141,7 +242,9 @@ def install(cfg: dict) -> dict:
         target = mods_dir / name
         try:
             if not target.exists() or _sha256(target) != _sha256(source):
-                shutil.copy2(source, target)
+                if target.exists():
+                    shutil.copy2(target, target.with_name(f"{target.name}.bak-{tc.now_stamp()}"))
+                _atomic_copy(source, target)
             installed_mods.append(name)
         except OSError as exc:
             return {"ok": False, "stage": "mod", "reason": f"{type(exc).__name__}: {exc}"}
